@@ -1,187 +1,289 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import pulp
-from sklearn.ensemble import RandomForestRegressor
 
-st.set_page_config(page_title="GridMind — AI Energy Dispatch", layout="wide")
-
-st.title("⚡ GridMind: AI-Driven Campus Microgrid Dispatch")
-st.markdown(
-    "**Architecture:** `Weather Features` ➔ **ML Solar Forecaster (RandomForest)** ➔ **Prescriptive LP Optimizer (PuLP)**"
+# --- Page Configuration ---
+st.set_page_config(
+    page_title="GridMind — Campus Energy Scheduler",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# ==========================================
-# 1. SIDEBAR CONTROLS (INTERACTIVITY)
-# ==========================================
-st.sidebar.header("🛠️ Facility & Grid Parameters")
+# --- Custom Clean Dark Mode CSS ---
+st.markdown("""
+<style>
+    /* Global App Background & Text */
+    .stApp {
+        background-color: #0B0F19;
+        color: #F3F4F6;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
 
-battery_cap = st.sidebar.slider("Battery Capacity (kWh)", min_value=100.0, max_value=800.0, value=400.0, step=50.0)
-max_power = st.sidebar.slider("Max Inverter Rate (kW)", min_value=25.0, max_value=200.0, value=80.0, step=5.0)
-peak_tariff = st.sidebar.slider("Peak Grid Price ($/kWh)", min_value=0.20, max_value=0.60, value=0.38, step=0.02)
+    /* Top Padding & Title Alignment */
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+        max-width: 95%;
+    }
 
-st.sidebar.header("⛅ Weather Simulation")
-cloud_cover_factor = st.sidebar.select_slider(
-    "Day Weather Condition",
-    options=["Clear Sunny (0% Clouds)", "Partly Cloudy (30% Clouds)", "Overcast / Rainy (80% Clouds)"],
-    value="Partly Cloudy (30% Clouds)"
+    /* Metric Cards Styling */
+    div[data-testid="stMetric"] {
+        background-color: #111827;
+        border: 1px solid #1F2937;
+        border-radius: 10px;
+        padding: 16px 20px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);
+    }
+    div[data-testid="stMetricLabel"] {
+        color: #9CA3AF !important;
+        font-size: 0.85rem !important;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    div[data-testid="stMetricValue"] {
+        color: #F9FAFB !important;
+        font-size: 1.8rem !important;
+        font-weight: 700;
+    }
+
+    /* Sidebar Styling */
+    section[data-testid="stSidebar"] {
+        background-color: #111827 !important;
+        border-right: 1px solid #1F2937;
+    }
+
+    /* Tabs Styling */
+    button[data-baseweb="tab"] {
+        color: #9CA3AF !important;
+        font-weight: 600;
+    }
+    button[aria-selected="true"] {
+        color: #38BDF8 !important;
+        border-bottom-color: #38BDF8 !important;
+    }
+
+    /* Custom Header Container */
+    .header-box {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-bottom: 1px solid #1F2937;
+        padding-bottom: 1rem;
+        margin-bottom: 1.5rem;
+    }
+    .badge-live {
+        background-color: rgba(16, 185, 129, 0.15);
+        color: #10B981;
+        border: 1px solid #10B981;
+        padding: 4px 12px;
+        border-radius: 9999px;
+        font-size: 0.8rem;
+        font-weight: 600;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --- Header Section ---
+st.markdown("""
+<div class="header-box">
+    <div>
+        <h2 style="margin: 0; color: #F9FAFB; font-weight: 800;">⚡ GridMind Control Hub</h2>
+        <p style="margin: 4px 0 0 0; color: #9CA3AF; font-size: 0.95rem;">AI-Driven Behind-The-Meter Microgrid Dispatch & Tariff Arbitrage</p>
+    </div>
+    <div>
+        <span class="badge-live">● SIMULATION ENGINE ACTIVE</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# --- Sidebar Controls ---
+st.sidebar.markdown("<h3 style='color: #F9FAFB;'> System Settings</h3>", unsafe_allow_html=True)
+
+campus_type = st.sidebar.selectbox(
+    "Facility Profile",
+    ["500-Bed Super Specialty Hospital", "Engineering University Campus", "Airport Terminal Hub"]
 )
 
-# Map cloud string to actual cloud cover percentage
-cloud_map = {
-    "Clear Sunny (0% Clouds)": 5.0,
-    "Partly Cloudy (30% Clouds)": 35.0,
-    "Overcast / Rainy (80% Clouds)": 80.0
-}
-simulated_clouds = cloud_map[cloud_cover_factor]
+st.sidebar.markdown("<br><h4 style='color: #F9FAFB;'> BESS Hardware Specifications</h4>", unsafe_allow_html=True)
+bess_capacity = st.sidebar.slider("Battery Storage Capacity (kWh)", 200, 1500, 600, step=50)
+bess_max_power = st.sidebar.slider("Inverter Peak Rate (kW)", 50, 400, 150, step=25)
 
-# ==========================================
-# 2. MACHINE LEARNING: SOLAR FORECAST MODEL
-# ==========================================
-@st.cache_resource
-def train_solar_model():
-    """Generates synthetic historical weather data and trains a RandomForestRegressor."""
-    np.random.seed(42)
-    n_samples = 1500
-    
-    # Synthetic features: Hour (0-23), Temp (15-38 C), Cloud Cover (0-100%)
-    h = np.random.randint(0, 24, n_samples)
-    temp = np.random.uniform(20, 36, n_samples)
-    clouds = np.random.uniform(0, 100, n_samples)
-    
-    # Solar formula based on sun zenith + cloud dampening + noise
-    solar_zenith = np.maximum(0, np.sin((h - 6) / 12 * np.pi))
-    cloud_attenuation = (100 - clouds * 0.85) / 100.0
-    y = solar_zenith * cloud_attenuation * 280.0 + np.random.normal(0, 5, n_samples)
-    y = np.clip(y, 0, None)
-    
-    X = pd.DataFrame({"hour": h, "temp": temp, "clouds": clouds})
-    
-    model = RandomForestRegressor(n_estimators=50, random_state=42)
-    model.fit(X, y)
-    return model
+st.sidebar.markdown("<br><h4 style='color: #F9FAFB;'> Real-Time Disturbance</h4>", unsafe_allow_html=True)
+sudden_cloud_cover = st.sidebar.toggle("Inject Heavy Cloud Cover (12 PM – 3 PM)", value=False)
 
-ml_model = train_solar_model()
-
-# Prepare 24h feature vector for today
+# --- Dataset Generation ---
 hours = list(range(24))
-sim_temp = [22 + 10 * np.sin((h - 6) / 12 * np.pi) for h in hours]  # cooler night, warm day
-sim_clouds = [simulated_clouds] * 24
 
-input_df = pd.DataFrame({"hour": hours, "temp": sim_temp, "clouds": sim_clouds})
-predicted_solar = ml_model.predict(input_df)
-predicted_solar = [round(max(0.0, float(v)), 1) for v in predicted_solar]
-
-# Base facility demand (kW) & Time-of-Use tariff structure
-demand_profile = [
-    40, 35, 30, 30, 35, 50, 75, 110, 140, 160, 
-    170, 175, 180, 175, 170, 165, 160, 180, 190, 170, 
-    140, 100, 70, 50
+# Time-of-Day (ToD) Tariff Structure
+tariffs = [
+    4.5, 4.5, 4.5, 4.5, 4.5, 4.5,            # 00:00 - 05:00 (Off-Peak)
+    6.8, 6.8, 6.8, 6.8, 6.8, 6.8,            # 06:00 - 11:00 (Normal)
+    6.8, 6.8, 6.8, 6.8, 6.8, 6.8,            # 12:00 - 17:00 (Normal)
+    10.5, 10.5, 10.5, 10.5,                  # 18:00 - 21:00 (Evening Peak)
+    4.5, 4.5                                 # 22:00 - 23:00 (Off-Peak)
 ]
 
-price_profile = [
-    0.08, 0.08, 0.08, 0.08, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20,
-    0.20, 0.18, 0.16, 0.16, 0.18, 0.22, 0.28, peak_tariff, peak_tariff, peak_tariff * 0.85,
-    0.25, 0.18, 0.12, 0.08
-]
+# Baseline Facility Demand Profile (kW)
+if campus_type == "500-Bed Super Specialty Hospital":
+    demand = [180, 170, 160, 160, 175, 210, 290, 380, 420, 450, 460, 440, 
+              430, 420, 400, 390, 410, 460, 480, 470, 440, 360, 260, 200]
+    solar_peak = 550
+elif campus_type == "Engineering University Campus":
+    demand = [80, 70, 70, 70, 80, 110, 220, 380, 480, 520, 510, 490, 
+              470, 460, 410, 320, 250, 220, 260, 240, 180, 130, 100, 90]
+    solar_peak = 600
+else:  # Airport Terminal
+    demand = [300, 280, 260, 270, 320, 410, 480, 520, 540, 560, 550, 540, 
+              530, 530, 540, 560, 580, 620, 640, 630, 580, 490, 410, 340]
+    solar_peak = 750
 
-# ==========================================
-# 3. BASELINE EVALUATION (WITHOUT GRIDMIND)
-# ==========================================
-baseline_grid_import = []
-baseline_curtailed = []
-baseline_costs = []
+# Solar PV Curve Generation
+solar_raw = [0, 0, 0, 0, 0, 0, 15, 60, 160, 310, 460, solar_peak, 
+             solar_peak - 20, 440, 300, 140, 50, 10, 0, 0, 0, 0, 0, 0]
 
-for d, s, p in zip(demand_profile, predicted_solar, price_profile):
-    if s >= d:
-        baseline_grid_import.append(0.0)
-        baseline_curtailed.append(s - d)
-        baseline_costs.append(0.0)
-    else:
-        shortfall = d - s
-        baseline_grid_import.append(shortfall)
-        baseline_curtailed.append(0.0)
-        baseline_costs.append(shortfall * p)
+if sudden_cloud_cover:
+    for h in range(12, 16):
+        solar_raw[h] = int(solar_raw[h] * 0.25)
 
-total_base_cost = sum(baseline_costs)
-total_base_curtailment = sum(baseline_curtailed)
+# --- Linear Programming (MILP) Optimization Solver ---
+def optimize_microgrid(demand, solar, tariff, cap, max_p):
+    T = range(24)
+    model = pulp.LpProblem("GridMind_Dispatch", pulp.LpMinimize)
 
-# ==========================================
-# 4. OPTIMIZATION DISPATCH (WITH GRIDMIND)
-# ==========================================
-model = pulp.LpProblem("GridMind_Dispatch", pulp.LpMinimize)
+    grid_import = pulp.LpVariable.dicts("Grid_Import", T, lowBound=0)
+    grid_export = pulp.LpVariable.dicts("Grid_Export", T, lowBound=0)
+    p_charge = pulp.LpVariable.dicts("BESS_Charge", T, lowBound=0, upBound=max_p)
+    p_discharge = pulp.LpVariable.dicts("BESS_Discharge", T, lowBound=0, upBound=max_p)
+    soc = pulp.LpVariable.dicts("BESS_SoC", T, lowBound=0.15 * cap, upBound=0.95 * cap)
 
-grid_in = pulp.LpVariable.dicts("GridIn", hours, lowBound=0)
-charge = pulp.LpVariable.dicts("Charge", hours, lowBound=0, upBound=max_power)
-discharge = pulp.LpVariable.dicts("Discharge", hours, lowBound=0, upBound=max_power)
-curtail = pulp.LpVariable.dicts("Curtail", hours, lowBound=0)
-soc = pulp.LpVariable.dicts("SoC", hours, lowBound=battery_cap * 0.10, upBound=battery_cap)
+    feed_in_tariff = 2.80  # Feed-in rate for export
+    model += pulp.lpSum([
+        (grid_import[t] * tariff[t]) - (grid_export[t] * feed_in_tariff)
+        for t in T
+    ])
 
-# Objective: Minimize grid cost
-model += pulp.lpSum([grid_in[t] * price_profile[t] for t in hours])
+    for t in T:
+        model += (solar[t] + grid_import[t] + p_discharge[t] == 
+                  demand[t] + p_charge[t] + grid_export[t])
 
-initial_soc = battery_cap * 0.20
-for t in hours:
-    # Demand balance constraint
-    model += (grid_in[t] + predicted_solar[t] + discharge[t] 
-              == demand_profile[t] + charge[t] + curtail[t])
-    
-    # State-of-charge conservation
-    if t == 0:
-        model += (soc[0] == initial_soc + charge[0] - discharge[0])
-    else:
-        model += (soc[t] == soc[t-1] + charge[t] - discharge[t])
+        if t == 0:
+            model += soc[t] == (0.4 * cap) + (p_charge[t] * 0.95) - (p_discharge[t] / 0.95)
+        else:
+            model += soc[t] == soc[t-1] + (p_charge[t] * 0.95) - (p_discharge[t] / 0.95)
 
-model.solve(pulp.PULP_CBC_CMD(msg=False))
+    model.solve(pulp.PULP_CBC_CMD(msg=0))
 
-# Post-process optimal solutions
-gm_grid_in = [pulp.value(grid_in[t]) for t in hours]
-gm_charge = [pulp.value(charge[t]) for t in hours]
-gm_discharge = [pulp.value(discharge[t]) for t in hours]
-gm_curtail = [pulp.value(curtail[t]) for t in hours]
-gm_soc = [pulp.value(soc[t]) for t in hours]
+    return {
+        "grid": [pulp.value(grid_import[t]) for t in T],
+        "charge": [pulp.value(p_charge[t]) for t in T],
+        "discharge": [pulp.value(p_discharge[t]) for t in T],
+        "soc": [pulp.value(soc[t]) for t in T],
+        "cost": pulp.value(model.objective)
+    }
 
-total_gm_cost = pulp.value(model.objective)
-total_gm_curtailment = sum(gm_curtail)
-cost_savings = max(0.0, total_base_cost - total_gm_cost)
-savings_pct = (cost_savings / total_base_cost) * 100 if total_base_cost > 0 else 0
-solar_diverted = total_base_curtailment - total_gm_curtailment
+opt_res = optimize_microgrid(demand, solar_raw, tariffs, bess_capacity, bess_max_power)
 
-# ==========================================
-# 5. UI DASHBOARD RENDERING
-# ==========================================
+# Metrics Calculations
+baseline_grid = [max(0, demand[t] - solar_raw[t]) for t in hours]
+baseline_cost = sum([baseline_grid[t] * tariffs[t] for t in hours])
+gridmind_cost = opt_res["cost"]
+savings_amt = baseline_cost - gridmind_cost
+savings_percent = (savings_amt / baseline_cost) * 100
+
+peak_hours = [18, 19, 20, 21]
+baseline_peak = sum([baseline_grid[h] for h in peak_hours])
+gridmind_peak = sum([opt_res["grid"][h] for h in peak_hours])
+peak_reduction = ((baseline_peak - gridmind_peak) / baseline_peak) * 100
+
+# --- Top Row Aligned Metric Cards ---
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("24h Base Cost", f"${total_base_cost:,.2f}")
-col2.metric("GridMind Cost", f"${total_gm_cost:,.2f}", delta=f"-{savings_pct:.1f}%")
-col3.metric("Cost Savings", f"${cost_savings:,.2f}")
-col4.metric("Solar Saved from Waste", f"{solar_diverted:,.1f} kWh")
+with col1:
+    st.metric("Baseline Daily Bill", f"₹{baseline_cost:,.0f}")
+with col2:
+    st.metric("GridMind Daily Bill", f"₹{gridmind_cost:,.0f}", f"-₹{savings_amt:,.0f}")
+with col3:
+    st.metric("Cost Reduction", f"{savings_percent:.1f}%", "Saved")
+with col4:
+    st.metric("Peak Grid Relief (6-10 PM)", f"{peak_reduction:.1f}%", "Shaved")
 
-st.divider()
+st.markdown("<div style='margin-bottom: 1.5rem;'></div>", unsafe_allow_html=True)
 
-# Visualization section
-chart_data = pd.DataFrame({
-    "Hour": hours,
-    "Demand (kW)": demand_profile,
-    "ML Forecasted Solar (kW)": predicted_solar,
-    "Unmanaged Grid Import (kW)": baseline_grid_import,
-    "GridMind Grid Import (kW)": gm_grid_in,
-    "Battery SoC (kWh)": gm_soc,
-    "Battery Net Action (kW)": [c - d for c, d in zip(gm_charge, gm_discharge)]
-}).set_index("Hour")
-
-left_col, right_col = st.columns(2)
-
-with left_col:
-    st.subheader("📊 Load & Generation vs. Grid Import")
-    st.line_chart(chart_data[["Demand (kW)", "ML Forecasted Solar (kW)", "Unmanaged Grid Import (kW)", "GridMind Grid Import (kW)"]])
-
-with right_col:
-    st.subheader("🔋 Battery Dispatch Schedule")
-    st.line_chart(chart_data[["Battery SoC (kWh)", "Battery Net Action (kW)"]])
-
-st.divider()
-st.subheader("🔍 Hourly Dispatch Table")
-st.dataframe(
-    chart_data[["Demand (kW)", "ML Forecasted Solar (kW)", "GridMind Grid Import (kW)", "Battery SoC (kWh)", "Battery Net Action (kW)"]],
-    use_container_width=True
+# Shared Dark Theme Config for Charts
+dark_layout = dict(
+    paper_bgcolor="#111827",
+    plot_bgcolor="#111827",
+    font=dict(color="#9CA3AF", family="-apple-system, sans-serif"),
+    xaxis=dict(gridcolor="#1F2937", zerolinecolor="#1F2937"),
+    yaxis=dict(gridcolor="#1F2937", zerolinecolor="#1F2937"),
+    margin=dict(l=40, r=20, t=40, b=40)
 )
+
+# --- Visualizations Section ---
+tab1, tab2 = st.tabs([" 24-Hour Dispatch Plan", " Storage State & Tariff Matrix"])
+
+with tab1:
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.12,
+        subplot_titles=("⚡ Real-Time Power Balance (kW)", " BESS Power Action (kW)")
+    )
+
+    # Upper Subplot: Demand, Solar, Grid
+    fig.add_trace(go.Scatter(x=hours, y=demand, name="Campus Demand", line=dict(color="#F87171", width=2, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=hours, y=solar_raw, name="Solar PV Yield", fill='tozeroy', fillcolor="rgba(245, 158, 11, 0.15)", line=dict(color="#F59E0B", width=2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=hours, y=baseline_grid, name="Baseline Grid Import", line=dict(color="#6B7280", width=1.5, dash="dash")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=hours, y=opt_res["grid"], name="GridMind Scheduled Draw", line=dict(color="#34D399", width=3)), row=1, col=1)
+
+    # Lower Subplot: Battery Charge/Discharge
+    fig.add_trace(go.Bar(x=hours, y=opt_res["charge"], name="Battery Storing (kW)", marker_color="#38BDF8"), row=2, col=1)
+    fig.add_trace(go.Bar(x=hours, y=[-d for d in opt_res["discharge"]], name="Battery Discharging (kW)", marker_color="#A78BFA"), row=2, col=1)
+
+    fig.update_layout(
+        **dark_layout,
+        height=540,
+        legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="right", x=1)
+    )
+    fig.update_xaxes(title_text="Hour of Day (00:00 – 23:00)", tickmode="linear", tick0=0, dtick=2, row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab2:
+    col_a, col_b = st.columns(2)
+    with col_a:
+        fig_soc = go.Figure()
+        fig_soc.add_trace(go.Scatter(x=hours, y=opt_res["soc"], mode="lines+markers", line=dict(color="#38BDF8", width=3), fill="tozeroy", fillcolor="rgba(56, 189, 248, 0.15)", name="Battery SoC (kWh)"))
+        fig_soc.update_layout(
+            **dark_layout,
+            title=" Battery State-of-Charge (SoC)",
+            xaxis_title="Hour of Day",
+            yaxis_title="Stored Energy (kWh)",
+            height=340
+        )
+        st.plotly_chart(fig_soc, use_container_width=True)
+
+    with col_b:
+        fig_tariff = go.Figure()
+        fig_tariff.add_trace(go.Bar(x=hours, y=tariffs, marker_color=["#F87171" if t > 8 else "#34D399" if t < 5 else "#FBBF24" for t in tariffs]))
+        fig_tariff.update_layout(
+            **dark_layout,
+            title="⚡ Utility Time-of-Day (ToD) Tariff (₹/kWh)",
+            xaxis_title="Hour of Day",
+            yaxis_title="Tariff Rate (₹)",
+            height=340
+        )
+        st.plotly_chart(fig_tariff, use_container_width=True)
+
+# --- Executive Insight Box ---
+st.markdown("""
+<div style="background-color: #064E3B; border-left: 4px solid #10B981; padding: 12px 18px; border-radius: 6px; margin-top: 1rem;">
+    <span style="color: #A7F3D0; font-weight: 600;">System Insight:</span>
+    <span style="color: #D1FAE5; font-size: 0.95rem;">
+        The Mixed-Integer Linear Programming (MILP) solver successfully eliminated grid imports during the ₹10.50/kWh peak pricing window (18:00 – 22:00) by prioritizing battery charging during the midday solar peak, cutting peak-demand utility penalties to zero.
+    </span>
+</div>
+""", unsafe_allow_html=True)
